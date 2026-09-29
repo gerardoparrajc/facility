@@ -1,12 +1,12 @@
 import { Divider, Eyebrow, PillTag } from "@facility/ui";
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { ErrorNotice, resultFallback } from "@/components/offline";
 import { DisconnectRepository } from "@/components/project/disconnect-repository";
 import { NativePreviews } from "@/components/project/native-previews";
 import { WorkspaceVariables } from "@/components/story/workspace-variables";
 import { api } from "@/lib/api";
 import { can } from "@/lib/permissions";
-import { notFound } from "next/navigation";
 
 export const metadata = { title: "project settings" };
 

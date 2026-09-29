@@ -1,6 +1,6 @@
-import type { ApiResult } from "@/lib/api";
 import { Eyebrow } from "@facility/ui";
 import type React from "react";
+import type { ApiResult } from "@/lib/api";
 
 /** Honest failure state — never fake data when the control plane is down. */
 export function Offline({ detail }: { detail?: string }) {

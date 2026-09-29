@@ -46,7 +46,7 @@ export default async function StoryPage({
     api.me(),
   ]);
 
-  if (!detail.ok) {    
+  if (!detail.ok) {
     if (detail.status === 404) notFound();
     return resultFallback(detail);
   }

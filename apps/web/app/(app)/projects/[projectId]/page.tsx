@@ -1,7 +1,7 @@
 import { Eyebrow, StatusDot } from "@facility/ui";
 import Link from "next/link";
 import { AttentionRow } from "@/components/attention/attention-row";
-import { ErrorNotice, Offline, resultFallback } from "@/components/offline";
+import { resultFallback } from "@/components/offline";
 import { LiveRefresh } from "@/components/shell/live-refresh";
 import { CancelTurnButton } from "@/components/story/workspace-story-controls";
 import {

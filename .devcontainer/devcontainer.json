@@ -3,7 +3,7 @@
   "image": "mcr.microsoft.com/devcontainers/javascript-node:24-bookworm",
 
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:1": {
+    "ghcr.io/devcontainers/features/docker-in-docker:latest": {
       "version": "latest",
       "moby": true
     }

@@ -1,7 +1,15 @@
+import { randomUUID } from "node:crypto";
 import { PassThrough } from "node:stream";
 import { Sandbox } from "@vercel/sandbox";
+import { COMMAND_JOURNAL_WRAPPER } from "./command-journal.js";
 import { CommandLogReplay, retryObservation } from "./command-observation.js";
+import {
+  parseWorkspaceHealth,
+  WORKSPACE_HEALTH_COMMAND,
+  type WorkspaceDiagnostics,
+} from "./diagnostics.js";
 import { nativePreviewOrigin } from "./native-preview.js";
+import { observeJournalCommand } from "./observe-journal-command.js";
 import {
   assertWorkspaceId,
   type CreateWorkspace,
@@ -34,8 +42,24 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     },
   ) {}
 
+  validateCreate(input: Omit<CreateWorkspace, "id">): void {
+    const cpu = input.resources?.cpu ?? 2;
+    if (
+      !Number.isInteger(cpu) ||
+      cpu < 1 ||
+      cpu > 32 ||
+      (input.resources && input.resources.memoryMb !== cpu * 2_048)
+    ) {
+      throw new WorkspaceRuntimeError(
+        "workspace_resources_invalid",
+        "Vercel requires 1–32 integer vCPUs with exactly 2048 MiB per vCPU; account limits also apply",
+      );
+    }
+  }
+
   async create(input: CreateWorkspace): Promise<WorkspaceHandle> {
     assertWorkspaceId(input.id);
+    this.validateCreate(input);
     const ports = validateWorkspacePorts(input.ports);
     const gatewayPorts = previewGatewayPorts(ports);
     const bootstrapCommand = workspaceBootstrapCommand(input);
@@ -53,7 +77,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       snapshotExpiration: 0,
       keepLastSnapshots: { count: 1, expiration: 0, deleteEvicted: true },
       timeout: SESSION_TIMEOUT_MS,
-      resources: { vcpus: Math.max(1, Math.ceil(input.resources?.cpu ?? 2)) },
+      resources: { vcpus: input.resources?.cpu ?? 2 },
       ports: gatewayPorts.map(({ gatewayPort }) => gatewayPort),
       env: { ...persistentWorkspaceEnvironment(), ...(input.environment ?? {}) },
       tags: { facility: "workspace" },
@@ -81,7 +105,11 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
         "Vercel workspace commands do not support stdin; pass data as an argument or file",
       );
     }
-    const sandbox = await this.get(workspace, true);
+    const sandbox = await this.get(workspace, command.resume !== false);
+    if (command.resume === false && sandbox.status !== "running") {
+      throw new WorkspaceRuntimeError("workspace_not_running", "Workspace compute is not running");
+    }
+    const session = sandbox.currentSession();
     const stdoutStream = new PassThrough();
     const stderrStream = new PassThrough();
     const stdout: Buffer[] = [];
@@ -94,32 +122,112 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       stderr.push(chunk);
       command.onOutput?.({ stream: "stderr", data: chunk.toString("utf8") });
     });
-    const running = await sandbox.asUser("node").runCommand({
-      cmd: command.command,
-      args: command.args,
+    const journalPath = command.onOutput
+      ? `/workspace/.facility/command-output/${randomUUID()}.ndjson`
+      : undefined;
+    const submission = {
+      cmd: journalPath ? "node" : command.command,
+      args: journalPath
+        ? ["-e", COMMAND_JOURNAL_WRAPPER, journalPath, command.command, ...(command.args ?? [])]
+        : command.args,
       cwd: command.cwd ?? "/workspace",
       env: { ...persistentWorkspaceEnvironment(), ...(command.env ?? {}) },
       timeoutMs:
         command.timeoutMs === undefined
           ? undefined
           : Math.min(command.timeoutMs, MAX_COMMAND_TIMEOUT_MS),
-      detached: true,
-    });
+      detached: true as const,
+    };
+    const running =
+      command.resume === false
+        ? await session.runCommand({
+            ...submission,
+            cmd: "sudo",
+            args: ["-u", "node", "--", submission.cmd, ...(submission.args ?? [])],
+          })
+        : await sandbox.asUser("node").runCommand(submission);
     const observation = new AbortController();
+    const deadline = setTimeout(
+      () =>
+        observation.abort(
+          new WorkspaceRuntimeError(
+            "workspace_command_timeout",
+            "Workspace command exceeded its observation deadline",
+          ),
+        ),
+      Math.min(command.timeoutMs ?? MAX_COMMAND_TIMEOUT_MS, MAX_COMMAND_TIMEOUT_MS) + 30_000,
+    );
+    deadline.unref();
+    let completed = false;
+    let killRequested = false;
+    const kill = async () => {
+      if (killRequested) return;
+      killRequested = true;
+      await running.kill("SIGTERM", { abortSignal: AbortSignal.timeout(10_000) });
+    };
     let canceled = command.signal?.aborted ?? false;
     const cancel = () => {
       canceled = true;
       observation.abort();
-      void running.kill("SIGTERM").catch(() => undefined);
+      void kill().catch(() => undefined);
     };
     command.signal?.addEventListener("abort", cancel, { once: true });
     if (canceled) cancel();
+    if (journalPath) {
+      try {
+        const result = await observeJournalCommand({
+          command: running,
+          session,
+          path: journalPath,
+          signal: observation.signal,
+          onOutput: ({ stream, data }) =>
+            (stream === "stdout" ? stdoutStream : stderrStream).write(data),
+          onObservation: (event) => {
+            console.info(
+              JSON.stringify({
+                event: "workspace.command_observation",
+                workspaceId: workspace.id,
+                commandId: running.cmdId,
+                ...event,
+              }),
+            );
+            command.onObservation?.(event);
+          },
+        });
+        completed = true;
+        return {
+          ...result,
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
+        };
+      } catch (error) {
+        observation.abort(error);
+        await kill().catch(() => {
+          console.warn(
+            JSON.stringify({ event: "workspace.command_cleanup_failed", commandId: running.cmdId }),
+          );
+        });
+        if (canceled)
+          throw new WorkspaceRuntimeError(
+            "workspace_command_canceled",
+            "workspace command was canceled",
+          );
+        throw observation.signal.reason;
+      } finally {
+        clearTimeout(deadline);
+        observation.abort();
+        command.signal?.removeEventListener("abort", cancel);
+        stdoutStream.end();
+        stderrStream.end();
+      }
+    }
     const logs = (async () => {
       const replay = new CommandLogReplay();
       for (let attempt = 0; ; attempt += 1) {
         replay.restart();
         try {
           for await (const log of running.logs({ signal: observation.signal })) {
+            observation.signal.throwIfAborted();
             const fresh = replay.append(log.stream, log.data);
             if (!fresh) continue;
             if (log.stream === "stdout") stdoutStream.write(fresh);
@@ -137,9 +245,11 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       for (let attempt = 0; ; attempt += 1) {
         const timeout = AbortSignal.timeout(30_000);
         try {
-          return await running.wait({
+          const result = await running.wait({
             signal: AbortSignal.any([observation.signal, timeout]),
           });
+          completed = true;
+          return result;
         } catch (error) {
           if (timeout.aborted && !observation.signal.aborted) {
             attempt = -1;
@@ -154,14 +264,25 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       [result] = await Promise.all([completion, logs]);
       if (canceled) throw new Error("command canceled");
     } catch (error) {
+      observation.abort();
+      if (!completed) {
+        await kill().catch(() => {
+          console.warn(
+            JSON.stringify({ event: "workspace.command_cleanup_failed", commandId: running.cmdId }),
+          );
+        });
+      }
       if (canceled) {
         throw new WorkspaceRuntimeError(
           "workspace_command_canceled",
           "workspace command was canceled",
         );
       }
+      if (observation.signal.reason instanceof WorkspaceRuntimeError)
+        throw observation.signal.reason;
       throw error;
     } finally {
+      clearTimeout(deadline);
       observation.abort();
       command.signal?.removeEventListener("abort", cancel);
       stdoutStream.end();
@@ -173,6 +294,19 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       stderr: Buffer.concat(stderr).toString("utf8"),
       durationMs: result.durationMs ?? 0,
     };
+  }
+
+  async previewOrigins(workspace: WorkspaceLocator, ports: CreateWorkspace["ports"] = []) {
+    if (!this.nativePreview || !(await this.nativePreview.enabledForWorkspace(workspace.id)))
+      return {};
+    // The gateway is initialized by create/wake, independently of the app.
+    // Reuse its credentialed binding check, without publishing lifecycle facts.
+    const endpoints = await this.expose(workspace, ports);
+    return Object.fromEntries(
+      endpoints
+        .filter((endpoint) => endpoint.access === "native")
+        .map((endpoint) => [endpoint.service, endpoint.url]),
+    );
   }
 
   async expose(workspace: WorkspaceLocator, ports: CreateWorkspace["ports"] = []) {
@@ -218,7 +352,12 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       return {
         id: workspace.id,
         provider: this.provider,
-        state: sandbox.status === "running" ? "running" : "sleeping",
+        state:
+          sandbox.status === "running"
+            ? "running"
+            : ["failed", "aborted"].includes(sandbox.status)
+              ? "error"
+              : "sleeping",
         computeRef: sandbox.status === "running" ? sandbox.currentSession().sessionId : undefined,
         volumeRef: sandbox.currentSnapshotId ?? workspace.volumeRef,
         endpoints:
@@ -244,10 +383,44 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     }
   }
 
+  async diagnostics(
+    workspace: WorkspaceLocator,
+    cwd: string,
+    signal: AbortSignal,
+  ): Promise<WorkspaceDiagnostics> {
+    const sandbox = await this.get(workspace, false, undefined, signal);
+    const session = sandbox.currentSession();
+    const result: WorkspaceDiagnostics = {
+      provider: this.provider,
+      state: sandbox.status,
+      computeRef: session.sessionId,
+    };
+    if (sandbox.status !== "running") return result;
+    try {
+      // Bind to this VM, not Sandbox.runCommand, which can implicitly resume compute.
+      const command = await session.runCommand({
+        cmd: "sudo",
+        args: ["-u", "node", "--", "node", "-e", WORKSPACE_HEALTH_COMMAND, cwd],
+        cwd: "/",
+        timeoutMs: 5_000,
+        signal,
+      });
+      if (command.exitCode !== 0) return { ...result, probe: "unavailable" };
+      return {
+        ...result,
+        probe: "ok",
+        health: parseWorkspaceHealth(await command.stdout({ signal })),
+      };
+    } catch {
+      return { ...result, probe: "unavailable" };
+    }
+  }
+
   async suspend(workspace: WorkspaceLocator): Promise<void> {
     try {
-      const sandbox = await this.get(workspace, false);
-      if (sandbox.status !== "stopped") await sandbox.stop();
+      const signal = AbortSignal.timeout(60_000);
+      const sandbox = await this.get(workspace, false, undefined, signal);
+      if (sandbox.status !== "stopped") await sandbox.stop({ signal });
     } catch (error) {
       if (!isVercelNotFound(error)) throw error;
     }
@@ -266,6 +439,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     workspace: WorkspaceLocator,
     resume: boolean,
     onResume?: (sandbox: Sandbox) => Promise<void>,
+    signal?: AbortSignal,
   ) {
     assertWorkspaceId(workspace.id);
     if (workspace.externalRef !== workspace.id) {
@@ -278,6 +452,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       ...this.credentials,
       name: workspace.externalRef,
       resume,
+      ...(signal ? { signal } : {}),
       ...(onResume ? { onResume } : {}),
     });
   }
@@ -497,8 +672,18 @@ NODE`
 
 function isVercelNotFound(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  const value = error as { code?: unknown; status?: unknown; statusCode?: unknown };
-  return value.code === "not_found" || value.status === 404 || value.statusCode === 404;
+  const value = error as {
+    code?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown };
+  };
+  return (
+    value.code === "not_found" ||
+    value.status === 404 ||
+    value.statusCode === 404 ||
+    value.response?.status === 404
+  );
 }
 
 function shellQuote(value: string): string {

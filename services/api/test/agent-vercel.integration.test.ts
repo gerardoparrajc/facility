@@ -29,7 +29,17 @@ function provider(
           { type: "item.completed", item: { type: "agent_message", text: "ready" } },
           { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
         ];
-  const wait = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
+  const frames = events.map(
+    (event, seq) =>
+      `${JSON.stringify({ seq, stream: "stdout", data: Buffer.from(`${JSON.stringify(event)}\n`).toString("base64") })}\n`,
+  );
+  if (exitCode)
+    frames.push(
+      `${JSON.stringify({ seq: frames.length, stream: "stderr", data: Buffer.from("command terminated").toString("base64") })}\n`,
+    );
+  const wait = vi
+    .fn<(input: { signal: AbortSignal }) => Promise<{ exitCode: number; durationMs: number }>>()
+    .mockResolvedValue({ exitCode, durationMs: 10 });
   const runCommand = vi.fn(async (params: { timeoutMs?: number; detached?: boolean }) => {
     // Reproduce the provider contract that rejected the real default engine request.
     if ((params.timeoutMs ?? 0) > 18_000_000) {
@@ -40,9 +50,8 @@ function provider(
       kill,
       logs: async function* () {
         onLog?.();
-        for (const event of events) yield { stream: "stdout", data: `${JSON.stringify(event)}\n` };
+        for (const data of frames) yield { stream: "stdout", data };
         if (logError) throw logError;
-        if (exitCode) yield { stream: "stderr", data: "command terminated" };
       },
       wait,
     };
@@ -50,7 +59,15 @@ function provider(
   const getCommand = vi.fn().mockResolvedValue({ exitCode, durationMs: 10 });
   sandboxApi.get.mockResolvedValue({
     asUser: () => ({ runCommand }),
-    currentSession: () => ({ getCommand }),
+    currentSession: () => ({
+      getCommand,
+      readFileToBuffer: async () =>
+        Buffer.from(
+          frames.join("") +
+            JSON.stringify({ seq: frames.length, type: "exit", exitCode, durationMs: 10 }) +
+            "\n",
+        ),
+    }),
   });
   return { runCommand, kill, wait };
 }
@@ -85,6 +102,52 @@ describe.each(["claude_code", "codex"] as const)("%s through the Vercel runtime"
     const runtime = new VercelWorkspaceRuntime();
     return engine === "codex" ? new CodexEngine(runtime) : new ClaudeCodeEngine(runtime);
   };
+
+  it("retains observation recovery events in the turn without changing the final agent response", async () => {
+    const { runCommand, kill, wait } = provider(engine, 0, undefined, new TypeError("terminated"));
+    wait.mockImplementation(
+      ({ signal }) =>
+        new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+        ),
+    );
+    const onEvent = vi.fn();
+    const result = await createEngine().run({ ...request(engine), onEvent });
+    expect(result.output).toBe("ready");
+    expect(result.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "observation",
+          data: expect.objectContaining({ operation: "logs", state: "recovering" }),
+        }),
+        expect.objectContaining({
+          type: "observation",
+          data: expect.objectContaining({ operation: "logs", state: "recovered" }),
+        }),
+      ]),
+    );
+    expect(onEvent.mock.calls.map(([event]) => event)).toEqual(result.events);
+    expect(runCommand).toHaveBeenCalledOnce();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("streams recoverable session evidence before a terminal provider failure without resubmitting", async () => {
+    const lost = Object.assign(new Error("Sandbox no longer available"), {
+      response: { status: 410 },
+    });
+    const { runCommand } = provider(engine, 0, undefined, lost);
+    const onEvent = vi.fn();
+    await expect(createEngine().run({ ...request(engine), onEvent })).rejects.toMatchObject({
+      code: "agent_observation_failed",
+      details: {
+        nativeSessionId: "native-session",
+        failure: { category: "workspace_session_lost", httpStatus: 410 },
+      },
+    });
+    expect(onEvent).toHaveBeenCalled();
+    expect(onEvent.mock.calls[0]?.[0]).toMatchObject({ engine });
+    expect(runCommand).toHaveBeenCalledOnce();
+  });
 
   it("starts the default agent command and resumes its native session within the provider ceiling", async () => {
     const { runCommand, kill } = provider(engine);
@@ -142,6 +205,8 @@ describe.each(["claude_code", "codex"] as const)("%s through the Vercel runtime"
     await expect(
       createEngine().run({ ...request(engine), signal: controller.signal }),
     ).rejects.toMatchObject({ code: "workspace_command_canceled" });
-    expect(kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+    expect(kill).toHaveBeenCalledExactlyOnceWith("SIGTERM", {
+      abortSignal: expect.any(AbortSignal),
+    });
   });
 });

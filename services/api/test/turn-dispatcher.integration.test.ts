@@ -20,10 +20,11 @@ import {
   turnGitEvidence,
   turns,
   turnUsage,
+  workspaces,
 } from "@facility/db";
 import { and, asc, eq } from "drizzle-orm";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AgentCatalogService, type AgentCatalogSource } from "../src/agents/catalog.js";
 import { GithubWorkspaceCredentialBroker } from "../src/github/workspace-credentials.js";
 import { StoryWorkspaceService } from "../src/stories/service.js";
@@ -36,6 +37,7 @@ import {
   type AgentTurnResult,
 } from "../src/turns/engines.js";
 import { TurnGitEvidenceService } from "../src/turns/git-evidence.js";
+import { LiveTurnEvents } from "../src/turns/live-events.js";
 import { recoverInterruptedTurns, recoverQueuedTurns } from "../src/worker.js";
 import { FakeWorkspaceRuntime } from "../src/workspaces/fake.js";
 import {
@@ -117,6 +119,7 @@ environment:
     renameNextBranch?: string;
     corruptResumeOnce = false;
     failNextRun = false;
+    liveFailureGate?: Promise<void>;
     throttleDuringRun = false;
     replacementPending = false;
     blockUntilCanceled = false;
@@ -124,6 +127,32 @@ environment:
     observedCancellation = false;
     async run(request: AgentTurnRequest): Promise<AgentTurnResult> {
       this.requests.push(request);
+      if (this.liveFailureGate) {
+        const gate = this.liveFailureGate;
+        this.liveFailureGate = undefined;
+        const events = [
+          {
+            engine: "codex" as const,
+            type: "thread.started",
+            data: { thread_id: "native-before-failure" },
+          },
+          {
+            engine: "codex" as const,
+            type: "item.completed",
+            data: { message: request.environment?.FACILITY_DISPATCH_SECRET },
+          },
+        ];
+        for (const event of events) request.onEvent?.(event);
+        await gate;
+        throw new AgentEngineError("agent_observation_failed", "Workspace session lost", {
+          events,
+          failure: {
+            category: "workspace_session_lost",
+            httpStatus: 410,
+            responseBody: "provider-private-secret",
+          },
+        });
+      }
       if (this.throttleDuringRun) {
         this.throttleDuringRun = false;
         throw Object.assign(new Error("API rate limit exceeded after execution began"), {
@@ -295,6 +324,8 @@ environment:
       ),
       new AgentEngineRegistry([engine]),
       new TurnGitEvidenceService(db, runtime),
+      undefined,
+      runtime,
     );
   });
 
@@ -574,7 +605,7 @@ environment:
         expect.objectContaining({
           turnId: followUp.turn.id,
           type: "engine.resume.failed",
-          data: { projectSecret: "[REDACTED]" },
+          data: { projectSecret: "[REDACTED]", facilityEventIndex: 0 },
         }),
       ]),
     );
@@ -624,6 +655,100 @@ environment:
     );
   });
 
+  it.each([
+    "wake",
+    "prepare",
+  ] as const)("suspends retained compute when %s fails after a sleeping workspace resumes", async (phase) => {
+    const started = await storiesService.start({
+      orgId,
+      projectId,
+      provider: "manual",
+      externalId: `resume-${phase}-${suffix}`,
+      title: "Recover a retained workspace",
+      agent: builder,
+      message: "Continue the retained work",
+      messageDedupeKey: `resume-${phase}-${suffix}`,
+      actor: { type: "user", id: "user_test" },
+      workspace: { image: "facility-runner:test", ports: [] },
+    });
+    const workspace = started.workspace;
+    const turn = started.queued.turn;
+    if (!workspace?.externalRef || !turn) throw new Error("expected workspace and turn");
+    const locator = {
+      id: workspace.id,
+      image: "facility-runner:test",
+      externalRef: workspace.externalRef,
+      volumeRef: workspace.volumeRef,
+    };
+    await runtime.exec(locator, {
+      command: "sh",
+      args: ["-lc", "printf retained > retained-work"],
+    });
+    await runtime.suspend(locator);
+    await db.update(workspaces).set({ state: "sleeping" }).where(eq(workspaces.id, workspace.id));
+    const requestsBefore = engine.requests.length;
+    const originalWake = runtime.wake.bind(runtime);
+    const failure =
+      phase === "wake"
+        ? vi.spyOn(runtime, "wake").mockImplementationOnce(async (input) => {
+            await originalWake(input);
+            throw new Error("wake acknowledgement lost");
+          })
+        : vi
+            .spyOn(ProjectEnvironmentService.prototype, "prepare")
+            .mockRejectedValueOnce(new Error("setup failed"));
+    try {
+      await expect(
+        dispatcher.dispatch({ orgId, projectId, turnId: turn.id }),
+      ).resolves.toMatchObject({ state: "failed" });
+      expect(engine.requests).toHaveLength(requestsBefore);
+      expect((await storiesService.get(orgId, projectId, started.story.id)).workspace?.state).toBe(
+        "sleeping",
+      );
+      expect((await runtime.inspect(locator)).state).toBe("sleeping");
+      expect((await runtime.read(locator, "retained-work")).toString()).toBe("retained");
+    } finally {
+      failure.mockRestore();
+    }
+  });
+
+  it("closes a failed turn even when its final telemetry flush fails", async () => {
+    const started = await storiesService.start({
+      orgId,
+      projectId,
+      provider: "manual",
+      externalId: `flush-failure-${suffix}`,
+      title: "Retain the primary failure",
+      agent: builder,
+      message: "Implement the change",
+      messageDedupeKey: `flush-failure-${suffix}`,
+      actor: { type: "user", id: "user_test" },
+      workspace: { image: "facility-runner:test", ports: [] },
+    });
+    if (!started.queued.turn) throw new Error("expected turn");
+    engine.failNextRun = true;
+    const original = LiveTurnEvents.prototype.finish;
+    const finish = vi.spyOn(LiveTurnEvents.prototype, "finish").mockImplementation(async function (
+      this: LiveTurnEvents,
+      events,
+    ) {
+      await original.call(this, events);
+      throw new Error("telemetry unavailable");
+    });
+    try {
+      await expect(
+        dispatcher.dispatch({ orgId, projectId, turnId: started.queued.turn.id }),
+      ).resolves.toMatchObject({ state: "failed" });
+      const current = await storiesService.get(orgId, projectId, started.story.id);
+      expect(current.turns.find((turn) => turn.id === started.queued.turn?.id)?.state).toBe(
+        "failed",
+      );
+      expect(current.workspace?.state).toBe("sleeping");
+    } finally {
+      finish.mockRestore();
+    }
+  });
+
   it("records engine events when a turn fails, with project secrets redacted", async () => {
     engine.failNextRun = true;
     const started = await storiesService.start({
@@ -653,6 +778,7 @@ environment:
             error: "authentication_failed",
             message: "API key is invalid.",
             projectSecret: "[REDACTED]",
+            facilityEventIndex: 0,
           },
         }),
         expect.objectContaining({ turnId: started.queued.turn.id, type: "turn.failed" }),
@@ -660,6 +786,82 @@ environment:
     );
     expect(JSON.stringify(failed)).not.toContain("project-secret");
   });
+
+  it("checkpoints redacted progress and session before failure, then resumes without replaying saved events", async () => {
+    const started = await storiesService.start({
+      orgId,
+      projectId,
+      provider: "manual",
+      externalId: `live-recovery-${suffix}`,
+      title: "Recover streamed context",
+      agent: builder,
+      message: "Continue work",
+      messageDedupeKey: `live-recovery-${suffix}`,
+      actor: { type: "user", id: "user_test" },
+      workspace: { image: "facility-runner:test", ports: [] },
+    });
+    if (!started.queued.turn) throw new Error("expected turn");
+    let release: (() => void) | undefined;
+    engine.liveFailureGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const turnId = started.queued.turn.id;
+    const transact = db.transaction.bind(db);
+    let lostAcknowledgement = false;
+    const transaction = vi.spyOn(db, "transaction").mockImplementation(async (...args) => {
+      const result = await transact(...args);
+      const saved = await db.select().from(turnEvents).where(eq(turnEvents.turnId, turnId));
+      if (!lostAcknowledgement && saved.some((event) => event.type.startsWith("engine."))) {
+        lostAcknowledgement = true;
+        throw new Error("commit acknowledgement lost");
+      }
+      return result;
+    });
+    const dispatch = dispatcher.dispatch({ orgId, projectId, turnId });
+    try {
+      await vi.waitFor(
+        async () => {
+          const stored = await db.select().from(turnEvents).where(eq(turnEvents.turnId, turnId));
+          expect(stored.filter((e) => e.type.startsWith("engine."))).toHaveLength(2);
+          expect(JSON.stringify(stored)).not.toContain("project-secret");
+          const session = await db
+            .select()
+            .from(engineSessions)
+            .where(eq(engineSessions.storyId, started.story.id));
+          expect(session[0]?.nativeSessionId).toBe("native-before-failure");
+          const turn = await db.select().from(turns).where(eq(turns.id, turnId));
+          expect(turn[0]?.state).toBe("running");
+        },
+        { timeout: 10000 },
+      );
+    } finally {
+      release?.();
+    }
+    await expect(dispatch).resolves.toMatchObject({ state: "failed" });
+    transaction.mockRestore();
+    expect(lostAcknowledgement).toBe(true);
+    const saved = await db.select().from(turnEvents).where(eq(turnEvents.turnId, turnId));
+    expect(saved.filter((e) => e.type.startsWith("engine."))).toHaveLength(2);
+    expect(JSON.stringify(saved)).not.toContain("provider-private-secret");
+    expect(saved.find((e) => e.type === "turn.failed")?.data).toMatchObject({
+      failure: { category: "workspace_session_lost", httpStatus: 410 },
+    });
+    const next = await storiesService.queueMessage({
+      orgId,
+      projectId,
+      storyId: started.story.id,
+      body: "Continue from retained work",
+      dedupeKey: `resume-live-${suffix}`,
+      agent: builder,
+      actor: { type: "user", id: "user_test" },
+      trigger: { type: "manual" },
+    });
+    if (!next.turn) throw new Error("expected continuation");
+    await expect(
+      dispatcher.dispatch({ orgId, projectId, turnId: next.turn.id }),
+    ).resolves.toMatchObject({ state: "succeeded" });
+    expect(engine.requests.at(-1)?.nativeSessionId).toBe("native-before-failure");
+  }, 15_000);
 
   it("cancels a running agent process while preserving the workspace and future turns", async () => {
     engine.blockUntilCanceled = true;
